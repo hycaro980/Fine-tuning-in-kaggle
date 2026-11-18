@@ -1,5 +1,6 @@
 #==================================
 #criado by HYC[]
+#(revisado: correções de fp16, EOS, mascaramento e datasets)
 #==================================
 
 import os
@@ -7,6 +8,7 @@ import sys
 import gc
 import subprocess
 import importlib
+import getpass
 
 
 # ------------------------------------------------------------
@@ -71,12 +73,13 @@ instalar([
 ])
 
 import torch
+import transformers
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling
+    DataCollatorForSeq2Seq
 )
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
@@ -164,10 +167,24 @@ def perguntar_opcao(texto, opcoes):
         print(f"Opção inválida. Use uma destas: {', '.join(opcoes)}")
 
 
+def perguntar_sim_nao(texto, padrao="s"):
+    resposta = perguntar(texto, padrao).lower()
+    return resposta.startswith("s")
+
+
 # ------------------------------------------------------------
 # Carregar modelo e tokenizer
 # ------------------------------------------------------------
-def carregar_modelo_base(nome_modelo, device_map="auto"):
+def _transformers_usa_dtype():
+    # A partir do transformers 4.56 o argumento é `dtype` (torch_dtype foi deprecado)
+    try:
+        partes = transformers.__version__.split(".")
+        return (int(partes[0]), int(partes[1])) >= (4, 56)
+    except Exception:
+        return False
+
+
+def carregar_modelo_base(nome_modelo, device_map="auto", dtype=torch.float16):
     print(f"\nCarregando modelo: {nome_modelo}")
 
     tokenizer = AutoTokenizer.from_pretrained(nome_modelo)
@@ -175,10 +192,12 @@ def carregar_modelo_base(nome_modelo, device_map="auto"):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    chave_dtype = "dtype" if _transformers_usa_dtype() else "torch_dtype"
+
     modelo = AutoModelForCausalLM.from_pretrained(
         nome_modelo,
-        torch_dtype=torch.float16,
-        device_map=device_map
+        device_map=device_map,
+        **{chave_dtype: dtype}
     )
 
     modelo.config.use_cache = False
@@ -235,8 +254,14 @@ def aplicar_lora(modelo, nome_modelo):
 
 
 # ------------------------------------------------------------
-# Dataset (CORRIGIDO PARA ERRO DE CASTERROR)
+# Dataset
 # ------------------------------------------------------------
+def _carregar_arquivo(caminho):
+    if caminho.endswith(".csv"):
+        return load_dataset("csv", data_files=caminho, split="train")
+    return load_dataset("json", data_files=caminho, split="train")
+
+
 def carregar_dataset():
     print("\n--- DATASET ---")
     print("1) Dataset completo do Hugging Face (com 1 única configuração)")
@@ -257,27 +282,28 @@ def carregar_dataset():
             ""
         )
         try:
+            # trust_remote_code removido: o datasets 4.x não suporta mais scripts de dataset
             if config:
-                ds = load_dataset(nome, name=config, split="train", trust_remote_code=True)
+                ds = load_dataset(nome, name=config, split="train")
             else:
-                ds = load_dataset(nome, split="train", trust_remote_code=True)
+                ds = load_dataset(nome, split="train")
         except Exception as e:
-            print(f"\nErro ao carregar o dataset completo: {type(e).__name__}")
-            print("Isso geralmente acontece quando o repositório tem vários arquivos CSV com colunas diferentes.")
-            print("Por favor, use a Opção 3 deste menu para escolher um arquivo específico.")
-            return carregar_dataset() # Chama de novo
+            print(f"\nErro ao carregar o dataset completo: {type(e).__name__}: {e}")
+            print("Se o repositório tiver vários arquivos com colunas diferentes, use a Opção 3.")
+            return carregar_dataset()
 
     elif tipo == "2":
         caminho = perguntar("Caminho do arquivo (ex: /kaggle/working/meu.jsonl): ")
-        if caminho.endswith(".csv"):
-            ds = load_dataset("csv", data_files=caminho, split="train")
-        else:
-            ds = load_dataset("json", data_files=caminho, split="train")
+        try:
+            ds = _carregar_arquivo(caminho)
+        except Exception as e:
+            print(f"Erro ao ler o arquivo: {e}")
+            return carregar_dataset()
 
     elif tipo == "3":
         repo_id = perguntar("ID do repositório (ex: Skskskd/Test-heretic): ")
         arquivo = perguntar("Nome exato do arquivo no repositório (ex: dataset_psicologo_60exemplos.csv): ")
-        
+
         print(f"Baixando {arquivo} de {repo_id}...")
         try:
             caminho_local = hf_hub_download(
@@ -285,14 +311,10 @@ def carregar_dataset():
                 filename=arquivo,
                 repo_type="dataset"
             )
+            ds = _carregar_arquivo(caminho_local)
         except Exception as e:
-            print(f"Erro ao baixar o arquivo: {e}")
+            print(f"Erro ao baixar/ler o arquivo: {e}")
             return carregar_dataset()
-
-        if caminho_local.endswith(".csv"):
-            ds = load_dataset("csv", data_files=caminho_local, split="train")
-        else:
-            ds = load_dataset("json", data_files=caminho_local, split="train")
 
     print("\nColunas disponíveis:", ds.column_names)
 
@@ -310,7 +332,8 @@ def carregar_dataset():
             print(f"Usando a primeira coluna disponível: {ds.column_names[0]}")
             coluna = ds.column_names[0]
 
-        ds = ds.rename_column(coluna, "text")
+        if coluna != "text":
+            ds = ds.rename_column(coluna, "text")
 
     else:
         instr = perguntar("Coluna de instrução: ", "instruction")
@@ -318,18 +341,76 @@ def carregar_dataset():
         out = perguntar("Coluna de resposta: ", "output")
 
         def montar_texto(ex):
-            instrucao = ex.get(instr, "")
-            entrada = ex.get(inp, "") if inp else ""
-            saida = ex.get(out, "")
+            instrucao = ex.get(instr, "") or ""
+            entrada = (ex.get(inp, "") or "") if inp else ""
+            saida = ex.get(out, "") or ""
 
             if entrada:
-                texto = f"### Instrução:\n{instrucao}\n### Entrada:\n{entrada}\n### Resposta:\n{saida}"
+                prompt = f"### Instrução:\n{instrucao}\n### Entrada:\n{entrada}\n### Resposta:\n"
             else:
-                texto = f"### Instrução:\n{instrucao}\n### Resposta:\n{saida}"
+                prompt = f"### Instrução:\n{instrucao}\n### Resposta:\n"
 
-            return {"text": texto}
+            # "prompt" é guardado separado para podermos mascarar a instrução no treino
+            return {"prompt": prompt, "text": prompt + saida}
 
         ds = ds.map(montar_texto)
+
+    return ds
+
+
+# ------------------------------------------------------------
+# Tokenização (com EOS e mascaramento correto)
+# ------------------------------------------------------------
+def preparar_tokenizacao(ds, tokenizer, max_len, treinar_so_resposta):
+    eos_id = tokenizer.eos_token_id
+    tem_prompt = "prompt" in ds.column_names
+    mascarar = treinar_so_resposta and tem_prompt
+
+    def tokenizar(batch):
+        textos = batch["text"]
+        prompts = batch["prompt"] if tem_prompt else None
+
+        enc = tokenizer(
+            textos,
+            truncation=True,
+            max_length=max_len - 1,   # reserva 1 posição pro EOS
+            add_special_tokens=True
+        )
+
+        input_ids_out, mask_out, labels_out = [], [], []
+
+        for i, ids in enumerate(enc["input_ids"]):
+            ids = list(ids)
+
+            # Garante EOS no fim: sem isso o modelo nunca aprende a parar de gerar
+            if eos_id is not None and (len(ids) == 0 or ids[-1] != eos_id):
+                ids.append(eos_id)
+
+            labels = list(ids)
+
+            if mascarar:
+                n_prompt = len(tokenizer(prompts[i], add_special_tokens=True)["input_ids"])
+                n_prompt = min(n_prompt, len(labels))
+                labels[:n_prompt] = [-100] * n_prompt
+
+            input_ids_out.append(ids)
+            mask_out.append([1] * len(ids))
+            labels_out.append(labels)
+
+        return {
+            "input_ids": input_ids_out,
+            "attention_mask": mask_out,
+            "labels": labels_out
+        }
+
+    ds = ds.map(
+        tokenizar,
+        batched=True,
+        remove_columns=ds.column_names
+    )
+
+    # Remove exemplos em que tudo foi mascarado (nada pra aprender)
+    ds = ds.filter(lambda ex: any(l != -100 for l in ex["labels"]))
 
     return ds
 
@@ -373,11 +454,15 @@ def fazer_finetuning():
     if modo == "1":
         device_map = "auto"
         STATE["modo"] = "lora"
+        dtype_modelo = torch.float16
     else:
         device_map = {"": 0} if torch.cuda.is_available() else None
         STATE["modo"] = "full"
+        # Full FT: pesos em fp32 + AMP fp16. Pesos fp16 com fp16=True quebram
+        # ("Attempting to unscale FP16 gradients").
+        dtype_modelo = torch.float32
 
-    modelo, tokenizer = carregar_modelo_base(nome_modelo, device_map=device_map)
+    modelo, tokenizer = carregar_modelo_base(nome_modelo, device_map=device_map, dtype=dtype_modelo)
 
     if modo == "1":
         print("\nAplicando LoRA...")
@@ -385,6 +470,12 @@ def fazer_finetuning():
         modelo.print_trainable_parameters()
 
     ds = carregar_dataset()
+
+    treinar_so_resposta = False
+    if "prompt" in ds.column_names:
+        treinar_so_resposta = perguntar_sim_nao(
+            "Treinar só na resposta (ignorar a instrução na loss)? [S/n]: ", "s"
+        )
 
     max_len = perguntar_int("Tamanho máximo de tokens (padrão 512): ", 512)
     epochs = perguntar_int("Número de épocas (padrão 1): ", 1)
@@ -394,24 +485,20 @@ def fazer_finetuning():
     lr_padrao = 2e-4 if modo == "1" else 1e-5
     lr = perguntar_float(f"Learning rate (padrão {lr_padrao}): ", lr_padrao)
 
-    def tokenizar(batch):
-        return tokenizer(
-            batch["text"],
-            truncation=True,
-            max_length=max_len,
-            padding="max_length"
-        )
-
     print("\nTokenizando dataset...")
-    ds = ds.map(
-        tokenizar,
-        batched=True,
-        remove_columns=ds.column_names
-    )
+    ds = preparar_tokenizacao(ds, tokenizer, max_len, treinar_so_resposta)
+    print(f"Exemplos após tokenização: {len(ds)}")
 
-    collator = DataCollatorForLanguageModeling(
+    if len(ds) == 0:
+        print("Nenhum exemplo válido no dataset. Verifique as colunas e o tamanho máximo.")
+        return
+
+    # Padding dinâmico por batch; labels são preenchidos com -100
+    collator = DataCollatorForSeq2Seq(
         tokenizer=tokenizer,
-        mlm=False
+        padding=True,
+        label_pad_token_id=-100,
+        pad_to_multiple_of=8
     )
 
     output_dir = os.path.join(OUTPUT_DIR, "checkpoints")
@@ -422,7 +509,7 @@ def fazer_finetuning():
         per_device_train_batch_size=batch,
         gradient_accumulation_steps=grad_acc,
         learning_rate=lr,
-        fp16=True,
+        fp16=torch.cuda.is_available(),
         logging_steps=10,
         save_strategy="epoch",
         report_to="none",
@@ -476,6 +563,7 @@ def gerar_texto(model, tokenizer, prompt, max_new_tokens=128, temperature=0.7):
             temperature=temperature,
             top_p=0.9,
             do_sample=True,
+            use_cache=True,   # use_cache=False na config deixaria a geração lenta
             pad_token_id=tokenizer.eos_token_id
         )
 
@@ -537,10 +625,11 @@ def postar_huggingface():
         print("Nenhum modelo treinado para postar.")
         return
 
-    print("\nVocê precisa de um token do Hugging Face.")
+    print("\nVocê precisa de um token do Hugging Face (com permissão de escrita).")
     print("Crie em: https://huggingface.co/settings/tokens")
 
-    token = perguntar("Token de acesso do Hugging Face: ")
+    # getpass não exibe o token na tela
+    token = getpass.getpass("Token de acesso do Hugging Face (oculto): ").strip()
 
     login(token=token, add_to_git_credential=False)
 
@@ -556,16 +645,24 @@ def postar_huggingface():
     opcao = perguntar_opcao("Escolha: ", ["1", "2"])
 
     if opcao == "1":
-        print("\nEnviando adapter LoRA...")
+        if not isinstance(modelo, PeftModel):
+            print("O modelo atual não é LoRA (foi full fine-tuning). Enviando o modelo completo.")
+        else:
+            print("\nEnviando adapter LoRA...")
+
         modelo.push_to_hub(repo_id, token=token)
         tokenizer.push_to_hub(repo_id, token=token)
 
-        print(f"\nAdapter LoRA enviado para: https://huggingface.co/{repo_id}")
+        print(f"\nEnviado para: https://huggingface.co/{repo_id}")
 
     else:
         if isinstance(modelo, PeftModel):
             print("\nMesclando LoRA ao modelo base...")
             modelo = modelo.merge_and_unload()
+
+        # Full FT treinou em fp32; sobe em fp16 pra metade do tamanho
+        modelo = modelo.to(torch.float16)
+        modelo.config.use_cache = True
 
         print("\nEnviando modelo completo...")
         modelo.push_to_hub(repo_id, token=token)
